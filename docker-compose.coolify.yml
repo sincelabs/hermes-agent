@@ -1,0 +1,125 @@
+# Hermes Agent on Coolify.
+#
+# The repo's own docker-compose.yml uses `network_mode: host` and a bind mount
+# to ~/.hermes. Neither works on Coolify: host networking bypasses the proxy and
+# gives the container no network alias, so nothing else can resolve it, and the
+# bind mount points at a path on the Coolify host that does not exist. This file
+# is the Coolify equivalent — same image, same entrypoint, routable networking.
+#
+# ONE container runs BOTH halves of Hermes:
+#
+#   gateway    :8642   GET /health, /v1/chat/completions, /v1/models
+#                      credential: API_SERVER_KEY
+#   dashboard  :9119   /api/* resources, GET /api/status
+#                      credential: a dashboard access token (see deploy.md §4)
+#
+# The gateway is the container's CMD; the dashboard is supervised by s6 inside
+# the same container when HERMES_DASHBOARD=1 (docker/s6-rc.d/dashboard/run).
+# Splitting them into two services would mean two containers writing the same
+# /opt/data volume, which Hermes does not support.
+#
+# Coolify setup: Build Pack = Docker Compose, compose file =
+# /docker-compose.coolify.yml. Full walkthrough in deploy.md.
+
+services:
+  # The service name is the hostname other Coolify resources use to reach this
+  # one over the shared `coolify` network. Renaming it breaks the adapter's
+  # HERMES_API_URL and every other cross-resource reference.
+  hermes-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    restart: unless-stopped
+
+    # The gateway runs as the container's main program. `/init` (s6) stays PID 1
+    # via the image's ENTRYPOINT — do not override the entrypoint here or the
+    # cont-init scripts and the supervised dashboard never run.
+    command: ['gateway', 'run']
+
+    environment:
+      # ─── Fixed. These are read-only in Coolify by design ──────────────────
+      # A literal here cannot be edited from the Coolify UI, which is what we
+      # want for anything that must be identical in every deployment. Values
+      # an operator has to choose are `${VAR}` below instead.
+
+      # Own the named volume as the image's built-in hermes user, so no
+      # usermod remap runs at boot.
+      HERMES_UID: '10000'
+      HERMES_GID: '10000'
+
+      # The OpenAI-compatible gateway API. Off unless explicitly enabled, and
+      # it refuses to start without API_SERVER_KEY — that check is the reason
+      # the key is required rather than optional below.
+      API_SERVER_ENABLED: 'true'
+      API_SERVER_HOST: '0.0.0.0'
+      API_SERVER_PORT: '8642'
+
+      # Start the supervised dashboard beside the gateway. Without this the
+      # slot stays down and everything except chat is unavailable.
+      HERMES_DASHBOARD: '1'
+      HERMES_DASHBOARD_HOST: '0.0.0.0'
+      HERMES_DASHBOARD_PORT: '9119'
+
+      # ─── Set these in Coolify → Environment Variables ─────────────────────
+      # Deliberately valueless. A default written here would be re-asserted
+      # from the compose file on every redeploy and shown locked in the UI.
+
+      # Gateway credential. `openssl rand -hex 32`.
+      API_SERVER_KEY: ${API_SERVER_KEY}
+
+      # Dashboard auth. A non-loopback bind engages the auth gate, and
+      # start_server fails closed unless a provider is registered — so on
+      # Coolify these are not optional. Username + password register the
+      # bundled `basic` provider.
+      HERMES_DASHBOARD_BASIC_AUTH_USERNAME: ${HERMES_DASHBOARD_BASIC_AUTH_USERNAME}
+      HERMES_DASHBOARD_BASIC_AUTH_PASSWORD: ${HERMES_DASHBOARD_BASIC_AUTH_PASSWORD}
+
+      # Token-signing key. Leave this unset and the provider generates a random
+      # one per process: every dashboard token — including the adapter's — is
+      # invalidated by a restart or a redeploy. `openssl rand -hex 32`.
+      HERMES_DASHBOARD_BASIC_AUTH_SECRET: ${HERMES_DASHBOARD_BASIC_AUTH_SECRET}
+
+      # Access-token lifetime in seconds; default 12h. The adapter holds a
+      # dashboard token and does not refresh it, so a 12h default means the
+      # adapter loses the dashboard overnight. See deploy.md §4.
+      HERMES_DASHBOARD_BASIC_AUTH_TTL_SECONDS: ${HERMES_DASHBOARD_BASIC_AUTH_TTL_SECONDS}
+
+      # The external origin Coolify serves the dashboard on, e.g.
+      # https://hermes.example.com. Used to build correct redirects behind the
+      # proxy. Leave empty if you do not assign a domain.
+      HERMES_DASHBOARD_PUBLIC_URL: ${HERMES_DASHBOARD_PUBLIC_URL}
+
+    volumes:
+      # HERMES_HOME. Sessions, config, cron jobs, MCP definitions, skills and
+      # credentials all live here. Coolify recreates the container on every
+      # deploy, so without this volume the agent is factory-reset each time.
+      - hermes_data:/opt/data
+
+    # Reachable on the `coolify` network by service name. Not published to the
+    # host: put a domain on 9119 in Coolify if you want the dashboard UI, and
+    # leave 8642 internal.
+    expose:
+      - '8642'
+      - '9119'
+
+    # The gateway's /health needs no credential. This checks the CMD process;
+    # the dashboard is supervised separately and restarts on its own.
+    healthcheck:
+      test: ['CMD-SHELL', 'curl -fsS http://127.0.0.1:8642/health >/dev/null || exit 1']
+      interval: 30s
+      timeout: 5s
+      # The first boot installs lazy packages onto the volume and can be slow.
+      start_period: 180s
+      retries: 5
+
+    stop_grace_period: 30s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
+
+volumes:
+  hermes_data:
