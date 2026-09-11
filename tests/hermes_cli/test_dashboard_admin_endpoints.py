@@ -36,6 +36,45 @@ class TestMcpEndpoints:
         self.client, self.header = _client()
 
 
+    def test_replace_rejects_an_unwrapped_map_instead_of_wiping_the_registry(self):
+        """A bare ``{name: config}`` body must not empty the registry.
+
+        ``MCPServersReplace.servers`` defaults to ``{}`` and the model ignores
+        unknown keys, so an unwrapped body used to be answered ``200 {"ok":
+        true}`` while ``_replace_mcp_servers({})`` dropped every server the
+        agent had. A control plane pushing its registry that way configured
+        nothing and was told it had succeeded.
+        """
+        self.client.post(
+            "/api/mcp/servers",
+            json={"name": "keepme", "url": "https://example.com/mcp"},
+        )
+
+        response = self.client.put(
+            "/api/mcp/servers",
+            json={"notion": {"url": "https://mcp.notion.com/mcp"}},
+        )
+
+        assert response.status_code == 422
+        assert "servers" in response.text
+        # The point of the refusal: the server that was there is still there.
+        names = [s["name"] for s in self.client.get("/api/mcp/servers").json()["servers"]]
+        assert names == ["keepme"]
+
+    def test_replace_accepts_the_wrapped_map_and_still_allows_clearing(self):
+        ok = self.client.put(
+            "/api/mcp/servers",
+            json={"servers": {"notion": {"url": "https://mcp.notion.com/mcp"}}},
+        )
+        assert ok.status_code == 200
+        listed = self.client.get("/api/mcp/servers").json()["servers"]
+        assert [s["name"] for s in listed] == ["notion"]
+        assert listed[0]["transport"] == "http"
+
+        # An explicit empty map is still a legitimate "remove everything".
+        assert self.client.put("/api/mcp/servers", json={"servers": {}}).status_code == 200
+        assert self.client.get("/api/mcp/servers").json()["servers"] == []
+
     def test_stdio_env_is_redacted_on_read(self):
         self.client.post(
             "/api/mcp/servers",

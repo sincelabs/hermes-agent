@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, SecretStr, StrictBool, field_validator
+from pydantic import BaseModel, SecretStr, StrictBool, field_validator, model_validator
 
 
 class ConfigUpdate(BaseModel):
@@ -316,6 +316,32 @@ class MCPServersReplace(BaseModel):
     # Whole-map replace (name → raw config) for the GUI mcp.json editor.
     servers: Dict[str, Dict[str, Any]] = {}
     profile: Optional[str] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_unwrapped_map(cls, data: Any) -> Any:
+        """Refuse a body that forgot the ``servers`` wrapper.
+
+        ``servers`` defaults to ``{}`` and unknown keys are ignored, so a client
+        that PUTs the bare ``{name: config}`` map — the shape every other MCP
+        route in this API speaks — used to be answered ``200 {"ok": true}`` and
+        have its whole registry deleted. Nothing downstream can tell that apart
+        from a deliberate clear, so the agent comes up with no MCP servers and
+        the caller believes it just configured some. Fail loudly instead.
+
+        An empty body still clears the registry: that is the explicit request,
+        and it carries no keys to mistake for server names.
+        """
+        if not isinstance(data, dict) or "servers" in data:
+            return data
+        unknown = sorted(k for k in data if k != "profile")
+        if not unknown:
+            return data
+        raise ValueError(
+            "body must be {\"servers\": {name: config}}; got a bare map of server "
+            f"definitions ({', '.join(unknown[:3])}). Replacing the registry with "
+            "that would silently delete every configured MCP server."
+        )
 
 class MCPEnabledToggle(BaseModel):
     enabled: bool
