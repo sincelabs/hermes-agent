@@ -66,6 +66,29 @@ def _run_event(run_id: str, name: str, **fields: Any) -> Dict[str, Any]:
     return {"event": name, "run_id": run_id, "timestamp": time.time(), **fields}
 
 
+def fill_subagent_event(
+    event: Dict[str, Any], tool_name: Any, preview: Any, kwargs: Dict[str, Any], *, redact
+) -> Dict[str, Any]:
+    """Add one relayed subagent frame's fields to ``event`` (mutated and returned).
+
+    Identity and counters ride verbatim; free text may carry a child's tool output, so it is
+    secret-redacted on the way to any public stream. Shared with the chat-completions relay:
+    both surfaces speak the same subagent vocabulary, and a client that learns one reads both.
+    """
+    if tool_name:
+        event["tool_name"] = str(tool_name)
+    if preview is not None:
+        event["preview"] = redact(str(preview), force=True)
+    for key in _SUBAGENT_EVENT_KEYS:
+        value = kwargs.get(key)
+        if value is not None:
+            # Free text may carry child tool output: force secret redaction on this public stream.
+            event[key] = (
+                redact(value, force=True)
+                if key in _SUBAGENT_TEXT_KEYS and isinstance(value, str) else value)
+    return event
+
+
 def _run_not_found(_openai_error, run_id: str) -> "web.Response":
     return _json_error(_openai_error, f"Run not found: {run_id}", code="run_not_found", status=404)
 
@@ -163,16 +186,9 @@ def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop
         if fields is not None:
             _push(_run_event(run_id, event_type, **fields(tool_name, preview, kwargs)))
         elif event_type in {"subagent.start", "subagent.complete"}:
-            event = _run_event(run_id, event_type)
-            if preview is not None:
-                event["preview"] = redact_sensitive_text(str(preview), force=True)
-            for key in _SUBAGENT_EVENT_KEYS:
-                value = kwargs.get(key)
-                if value is not None:
-                    # Free text may carry child tool output: force secret redaction on this public stream.
-                    redact = key in _SUBAGENT_TEXT_KEYS and isinstance(value, str)
-                    event[key] = redact_sensitive_text(value, force=True) if redact else value
-            _push(event)
+            _push(fill_subagent_event(
+                _run_event(run_id, event_type), None, preview, kwargs,
+                redact=redact_sensitive_text))
 
     return _callback
 

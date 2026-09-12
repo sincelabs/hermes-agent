@@ -1208,9 +1208,10 @@ class TestChatCompletionsEndpoint:
                 cb = kwargs.get("stream_delta_callback")
                 ts_cb = kwargs.get("tool_start_callback")
                 tc_cb = kwargs.get("tool_complete_callback")
-                # The structured callbacks own the chat-completions SSE
-                # channel now; ``tool_progress_callback`` is intentionally
-                # not wired so each tool start emits exactly one event.
+                # The structured callbacks own the tool half of the
+                # chat-completions SSE channel; ``tool_progress_callback``
+                # relays only ``subagent.*``, so each tool start still
+                # emits exactly one event.
                 if ts_cb:
                     ts_cb("call_terminal_1", "terminal", {"command": "ls -la"})
                 if tc_cb:
@@ -1260,6 +1261,111 @@ class TestChatCompletionsEndpoint:
             assert len(pairs) == 2, f"expected 2 events (running+completed), got {pairs}"
             assert pairs[0] == ("running", "call_terminal_1"), pairs
             assert pairs[1] == ("completed", "call_terminal_1"), pairs
+
+    @pytest.mark.asyncio
+    async def test_stream_relays_subagent_lifecycle(self, adapter):
+        """A delegated child must be watchable while it runs.
+
+        ``delegate_task`` is one tool call to the parent, so the structured tool callbacks say
+        only that work was handed off — never to whom, what they are doing, or what it cost.
+        The child's own relay carries all of that; this asserts it reaches the wire under its
+        own event name, with identity and counters intact, and that it stays out of
+        ``delta.content`` so the model never learns to imitate the markers.
+        """
+        import asyncio
+        import json as _json
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                progress_cb = kwargs.get("tool_progress_callback")
+                assert progress_cb is not None, "chat completions must relay subagent events"
+                progress_cb(
+                    "subagent.start", None, "audit the fleet",
+                    None, subagent_id="s1", goal="audit the fleet", model="hermes-4",
+                    depth=1, task_index=1, task_count=2)
+                progress_cb(
+                    "subagent.tool", "terminal", "docker ps", None,
+                    subagent_id="s1", tool_count=1)
+                # The parent's own tools ride the structured callbacks; relaying them here
+                # would draw every call twice.
+                progress_cb("tool.started", "web_search", "weather", None)
+                # Per-token child text is not worth a frame each on a stream plain OpenAI
+                # clients also read.
+                progress_cb("subagent.text", None, "Three ", None, subagent_id="s1")
+                progress_cb(
+                    "subagent.complete", None, "all healthy", None,
+                    subagent_id="s1", status="completed", summary="all healthy",
+                    duration_seconds=9.0, input_tokens=800, cost_usd=0.013)
+                if cb:
+                    await asyncio.sleep(0.05)
+                    cb("The fleet is healthy.")
+                return (
+                    {"final_response": "The fleet is healthy.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "audit the fleet"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+
+        # Pair each named event with the payload that follows it, so an assertion cannot pass
+        # on a field that belongs to a different frame.
+        events: list[tuple[str, dict]] = []
+        lines = body.splitlines()
+        for i, line in enumerate(lines):
+            if not line.startswith("event: subagent."):
+                continue
+            for follow in lines[i + 1: i + 3]:
+                if follow.startswith("data: "):
+                    events.append((line[len("event: "):], _json.loads(follow[len("data: "):])))
+                    break
+
+        assert [name for name, _ in events] == [
+            "subagent.start", "subagent.tool", "subagent.complete"], events
+
+        start = events[0][1]
+        assert start["subagent_id"] == "s1"
+        assert start["goal"] == "audit the fleet"
+        assert start["model"] == "hermes-4"
+        # Which branch of a fan-out, so a client can draw "1 of 2".
+        assert (start["task_index"], start["task_count"]) == (1, 2)
+        assert start["depth"] == 1
+
+        tool = events[1][1]
+        assert tool["tool_name"] == "terminal"
+        assert tool["preview"] == "docker ps"
+        assert tool["tool_count"] == 1
+
+        done = events[2][1]
+        assert done["status"] == "completed"
+        assert done["summary"] == "all healthy"
+        assert done["duration_seconds"] == 9.0
+        assert done["input_tokens"] == 800
+        assert done["cost_usd"] == 0.013
+
+        # The parent's own tool did not come through this relay.
+        assert "web_search" not in body
+        # No marker leaked into the assistant's text.
+        for line in lines:
+            if line.startswith("data: ") and line.strip() != "data: [DONE]":
+                try:
+                    chunk = _json.loads(line[len("data: "):])
+                except _json.JSONDecodeError:
+                    continue
+                if chunk.get("object") == "chat.completion.chunk":
+                    for choice in chunk.get("choices", []):
+                        assert "subagent" not in (choice.get("delta", {}).get("content") or "")
+        assert "The fleet is healthy." in body
 
     @pytest.mark.asyncio
     async def test_stream_tool_lifecycle_skips_internal_and_orphan_completes(self, adapter):

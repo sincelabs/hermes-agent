@@ -519,10 +519,29 @@ class OpenAICompatRoutesMixin:
                 _stream_q.put_threadsafe(("__tool_progress__", {
                     "tool": function_name, "toolCallId": tool_call_id, "status": "completed"}))
 
-            # tool_progress_callback deliberately NOT wired: it would duplicate the structured
-            # start/complete callbacks (which carry the tool_call id).
+            def _on_subagent(event_type, tool_name=None, preview=None, args=None, **kwargs):
+                """Relay a delegated child's lifecycle so a client can watch it work.
+
+                Only ``subagent.*``: the parent's own tools already ride the structured
+                start/complete callbacks above (which carry the tool_call id), and forwarding
+                them here would emit every call twice. ``subagent.text`` is dropped too — it is
+                the child's reply one token at a time, and this stream is also read by plain
+                OpenAI clients, so the relay stays proportional to what the child *does*. The
+                child's answer reaches the client on the completion frame's ``summary``.
+                """
+                if not isinstance(event_type, str) or not event_type.startswith("subagent."):
+                    return
+                if event_type == "subagent.text":
+                    return
+                from gateway.platforms.api_server import redact_sensitive_text
+                from gateway.platforms.api_server_runs import fill_subagent_event
+                _stream_q.put_threadsafe(("__subagent_event__", fill_subagent_event(
+                    {"event": event_type, "timestamp": time.time()}, tool_name, preview, kwargs,
+                    redact=redact_sensitive_text)))
+
             agent_task, agent_ref = self._spawn_stream_agent(
-                _stream_q, tool_start_callback=_on_tool_start,
+                _stream_q, tool_progress_callback=_on_subagent,
+                tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete, **run_kwargs)
             return await self._write_sse_chat_completion(
                 request, completion_id, model_name, created, _stream_q,
@@ -632,6 +651,10 @@ class OpenAICompatRoutesMixin:
                 if isinstance(delta, tuple) and len(delta) == 2 and delta[0] == "__tool_progress__":
                     # Custom event: tool lifecycle for frontends without markers in history.
                     await response.write(_sse_frame(delta[1], event="hermes.tool.progress"))
+                elif isinstance(delta, tuple) and len(delta) == 2 and delta[0] == "__subagent_event__":
+                    # Named with the child's own event ("subagent.start", ...) so a client
+                    # reads one vocabulary across this stream and /v1/runs.
+                    await response.write(_sse_frame(delta[1], event=delta[1]["event"]))
                 else:
                     await response.write(_sse_frame(_chunk({"content": delta})))
             # The agent can fail after the queue drains (task raises / result flagged failed or
