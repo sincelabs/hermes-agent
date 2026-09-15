@@ -310,6 +310,23 @@ export interface Translations {
       onceAt: string;
     };
     deliverTo: string;
+    // Optional: non-English locales fall back to the English literal in the
+    // component until translated, matching the `common.gateway` keys above.
+    /** The four counts that double as the list's filter. */
+    views?: {
+      all?: string;
+      failing?: string;
+      scheduled?: string;
+      paused?: string;
+    };
+    search?: string;
+    searchPlaceholder?: string;
+    noMatches?: string;
+    editJob?: string;
+    saveChanges?: string;
+    newJobHint?: string;
+    finishedNoRun?: string;
+    finishedNoResume?: string;
     scheduledJobs: string;
     noJobs: string;
     last: string;

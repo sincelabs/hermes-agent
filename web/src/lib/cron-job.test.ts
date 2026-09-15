@@ -2,9 +2,14 @@ import { describe, expect, it } from "vitest";
 
 import {
   buildCronJobPayload,
+  cronErrorText,
+  cronJobCounts,
   cronJobHasExecutionContent,
   cronJobFormFromJob,
+  cronJobIsTerminal,
+  cronJobState,
   cronLastResult,
+  filterCronJobs,
   splitCronList,
   type CronJobFormState,
 } from "./cron-job";
@@ -198,5 +203,96 @@ describe("cronLastResult", () => {
     expect(
       cronLastResult({ last_status: "blocked_config", last_error: "missing API key" }),
     ).toEqual({ status: "blocked_config", tone: "warning", detail: "missing API key" });
+  });
+});
+
+function job(overrides: Partial<CronJob> = {}): CronJob {
+  return {
+    id: "cron_1",
+    name: "morning-brief",
+    prompt: "Summarise the overnight alerts",
+    schedule: { kind: "cron", expr: "0 7 * * *", display: "weekdays at 7am" },
+    enabled: true,
+    state: "scheduled",
+    deliver: "local",
+    profile: "default",
+    ...overrides,
+  } as CronJob;
+}
+
+describe("cronJobState", () => {
+  it("prefers the stored state and falls back to the enabled flag", () => {
+    expect(cronJobState(job())).toBe("scheduled");
+    expect(cronJobState(job({ state: "paused", enabled: false }))).toBe("paused");
+    // A record with no state word but enabled=false is paused, not "disabled":
+    // the resume control keys off this, and "disabled" matched nothing.
+    expect(cronJobState(job({ state: undefined, enabled: false }))).toBe("paused");
+    expect(cronJobState(job({ state: undefined }))).toBe("scheduled");
+  });
+});
+
+describe("cronJobIsTerminal", () => {
+  it("only calls a completed job finished", () => {
+    expect(cronJobIsTerminal(job({ state: "completed", enabled: false }))).toBe(true);
+    expect(cronJobIsTerminal(job({ state: "paused", enabled: false }))).toBe(false);
+    // A recurring job stuck in `error` still has future occurrences.
+    expect(cronJobIsTerminal(job({ state: "error" }))).toBe(false);
+  });
+});
+
+describe("cronJobCounts and filterCronJobs", () => {
+  const jobs = [
+    job({ id: "a", last_status: "ok" }),
+    job({ id: "b", state: "paused", enabled: false, last_status: "error" }),
+    job({ id: "c", last_status: "delivery_failed" }),
+    job({ id: "d", name: "inbox-sweep", last_status: "ok" }),
+  ];
+
+  it("counts what is failing by the last run, not by the job's state", () => {
+    // `b` is paused AND failed; `c` ran fine but never delivered. Both count
+    // as failing — a report that never arrived is not a success.
+    expect(cronJobCounts(jobs)).toEqual({
+      all: 4,
+      failing: 2,
+      scheduled: 3,
+      paused: 1,
+    });
+  });
+
+  it("narrows to a view", () => {
+    expect(filterCronJobs(jobs, "failing", "").map((j) => j.id)).toEqual(["b", "c"]);
+    expect(filterCronJobs(jobs, "paused", "").map((j) => j.id)).toEqual(["b"]);
+    expect(filterCronJobs(jobs, "all", "").length).toBe(4);
+  });
+
+  it("searches name, prompt, schedule and skills", () => {
+    expect(filterCronJobs(jobs, "all", "INBOX").map((j) => j.id)).toEqual(["d"]);
+    expect(filterCronJobs(jobs, "all", "overnight").length).toBe(4);
+    expect(filterCronJobs(jobs, "all", "0 7 * *").length).toBe(4);
+    expect(filterCronJobs([job({ skills: ["triage"] })], "all", "triage").length).toBe(1);
+    expect(filterCronJobs(jobs, "all", "nothing here")).toEqual([]);
+  });
+});
+
+describe("cronErrorText", () => {
+  it("unwraps the agent's own sentence from the thrown envelope", () => {
+    // fetchJSON throws `Error("400: <body>")`; interpolating that into a toast
+    // produced "Error: Error: 400: {"detail":"…"}" and buried the reason.
+    expect(
+      cronErrorText(
+        new Error('400: {"detail":"Cannot resume: one-shot time is in the past"}'),
+      ),
+    ).toBe("Cannot resume: one-shot time is in the past");
+  });
+
+  it("joins FastAPI validation errors", () => {
+    expect(
+      cronErrorText(new Error('422: {"detail":[{"loc":["body"],"msg":"field required"}]}')),
+    ).toBe("field required");
+  });
+
+  it("falls back to the raw body when it is not JSON", () => {
+    expect(cronErrorText(new Error("502: Bad Gateway"))).toBe("Bad Gateway");
+    expect(cronErrorText("tunnel closed")).toBe("tunnel closed");
   });
 });

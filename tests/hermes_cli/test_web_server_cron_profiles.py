@@ -1190,3 +1190,65 @@ async def test_create_cron_job_without_profile_defaults_when_unscoped(
 
     assert job["profile"] == "default"
     assert (isolated_profiles["default"] / "cron" / "jobs.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_resume_of_an_expired_oneshot_is_a_400_with_its_reason(isolated_profiles):
+    """A refused resume is declined, not broken — and says why.
+
+    ``resume_job`` raises for a one-shot whose time has passed: resuming it
+    would arm a job that can never fire. That ValueError used to escape the
+    router as a bare 500, so the dashboard's Resume button looked broken and
+    the reason never reached the operator.
+    """
+    from hermes_cli import web_server  # noqa: F401  (router import side effects)
+
+    job = _web_server_cron._call_cron_for_profile(
+        "worker_alpha",
+        "create_job",
+        prompt="one and done",
+        schedule="in 1m",
+        name="expiring-oneshot",
+    )
+    await _rt_cron.pause_cron_job(job["id"], profile="worker_alpha")
+
+    # Move the one-shot's fire time into the past, well outside the grace window.
+    _web_server_cron._call_cron_for_profile("worker_alpha", "update_job", job["id"], {
+        "schedule": {"kind": "once", "run_at": "2020-01-01T00:00:00+00:00"}
+    })
+
+    with pytest.raises(HTTPException) as excinfo:
+        await _rt_cron.resume_cron_job(job["id"], profile="worker_alpha")
+
+    assert excinfo.value.status_code == 400
+    assert "past" in str(excinfo.value.detail).lower()
+
+
+@pytest.mark.asyncio
+async def test_trigger_of_a_terminal_job_says_it_is_finished(isolated_profiles):
+    """A finished job is refused as finished, not as "already running".
+
+    The claim is lost either way, but the two causes send an operator to very
+    different places: one is a race to wait out, the other is a job with no
+    occurrence left.
+    """
+    from hermes_cli import web_server  # noqa: F401
+
+    job = _web_server_cron._call_cron_for_profile(
+        "worker_alpha",
+        "create_job",
+        prompt="already finished",
+        schedule="every 1h",
+        name="finished-job",
+    )
+    _web_server_cron._call_cron_for_profile(
+        "worker_alpha", "update_job", job["id"], {"state": "completed", "enabled": False}
+    )
+
+    with pytest.raises(HTTPException) as excinfo:
+        await _rt_cron.trigger_cron_job(job["id"], profile="worker_alpha")
+
+    assert excinfo.value.status_code == 409
+    detail = str(excinfo.value.detail).lower()
+    assert "completed" in detail and "no occurrence left" in detail
+    assert "already running" not in detail

@@ -138,3 +138,108 @@ export function cronLastResult(
       : asString(job.last_error).trim() || asString(job.last_delivery_error).trim();
   return { status, tone, detail: detail || null };
 }
+
+/**
+ * The job's lifecycle word, derived the way the backend derives it.
+ *
+ * `enabled` is authoritative for whether the scheduler will fire the job;
+ * `state` carries the reason. A record that says neither is scheduled.
+ */
+export function cronJobState(job: Pick<CronJob, "state" | "enabled">): string {
+  return asString(job.state) || (job.enabled === false ? "paused" : "scheduled");
+}
+
+/**
+ * A job with no occurrence left. Neither Run nor Resume can do anything with
+ * one, so both are offered as disabled rather than as buttons that 409.
+ */
+export function cronJobIsTerminal(job: Pick<CronJob, "state" | "enabled">): boolean {
+  return cronJobState(job) === "completed";
+}
+
+/** The views the list can be narrowed to, in the order they are offered. */
+export type CronJobView = "all" | "failing" | "scheduled" | "paused";
+
+export interface CronJobCounts {
+  all: number;
+  failing: number;
+  scheduled: number;
+  paused: number;
+}
+
+/** True when the job's LAST RUN went wrong — not the same as its state. */
+function cronJobFailed(job: CronJob): boolean {
+  const result = cronLastResult(job);
+  return (result !== null && result.status !== "ok") || Boolean(job.last_fire_error?.detail);
+}
+
+export function cronJobCounts(jobs: readonly CronJob[]): CronJobCounts {
+  return {
+    all: jobs.length,
+    failing: jobs.filter(cronJobFailed).length,
+    scheduled: jobs.filter((j) => cronJobState(j) === "scheduled").length,
+    paused: jobs.filter((j) => cronJobState(j) === "paused").length,
+  };
+}
+
+/** The rows a view and a search box leave standing. */
+export function filterCronJobs(
+  jobs: readonly CronJob[],
+  view: CronJobView,
+  query: string,
+): CronJob[] {
+  const q = query.trim().toLowerCase();
+  return jobs.filter((job) => {
+    if (view === "failing" && !cronJobFailed(job)) return false;
+    if (view === "scheduled" && cronJobState(job) !== "scheduled") return false;
+    if (view === "paused" && cronJobState(job) !== "paused") return false;
+    if (!q) return true;
+    return [
+      asString(job.name),
+      asString(job.prompt),
+      asString(job.script),
+      asString(job.id),
+      asString(job.profile) || asString(job.profile_name),
+      asString(job.schedule_display) || asString(job.schedule?.display),
+      asString(job.schedule?.expr),
+      ...(Array.isArray(job.skills) ? job.skills : []),
+    ].some((field) => field.toLowerCase().includes(q));
+  });
+}
+
+/**
+ * What a failed request actually said.
+ *
+ * `fetchJSON` throws `Error("400: {\"detail\":\"…\"}")`, so interpolating the
+ * error into a toast produced "Error: Error: 400: {"detail":"…"}" and buried
+ * the one sentence the operator needed — which the backend is at pains to
+ * supply for a refused resume or a job that has already finished.
+ */
+export function cronErrorText(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error);
+  const match = /^(\d{3}):\s*([\s\S]*)$/.exec(raw.trim());
+  const body = match ? match[2].trim() : raw;
+  try {
+    const parsed: unknown = JSON.parse(body);
+    if (parsed && typeof parsed === "object") {
+      const detail = (parsed as { detail?: unknown }).detail;
+      if (typeof detail === "string" && detail.trim()) return detail.trim();
+      // FastAPI's validation errors are a list of {loc, msg}.
+      if (Array.isArray(detail)) {
+        const msgs = detail
+          .map((item) =>
+            item && typeof item === "object" ? String((item as { msg?: unknown }).msg ?? "") : "",
+          )
+          .filter(Boolean);
+        if (msgs.length) return msgs.join("; ");
+      }
+      if (detail && typeof detail === "object") {
+        const message = (detail as { message?: unknown }).message;
+        if (typeof message === "string" && message.trim()) return message.trim();
+      }
+    }
+  } catch {
+    /* not JSON — the raw body is the best we have */
+  }
+  return body || raw;
+}

@@ -161,16 +161,39 @@ def _update_cron_job_sync(job_id: str, body: CronJobUpdate, profile: Optional[st
     return _found(job)
 
 
+def _mutate_cron_state(profile: str, func_name: str, job_id: str):
+    """Pause/resume, turning a refusal into a 400 the UI can show.
+
+    ``resume_job`` raises ValueError for a one-shot whose time has passed (it
+    would never fire again) — a refusal with a reason worth reading. Letting it
+    escape made it a bare 500, so the Resume button read as broken rather than
+    as declined, and the reason never reached anyone.
+    """
+    try:
+        return _mutate_cron_for_profile(profile, func_name, job_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 def _pause_cron_job_sync(job_id: str, profile: Optional[str] = None):
-    return _found(_mutate_cron_for_profile(_job_profile(job_id, profile), "pause_job", job_id))
+    return _found(_mutate_cron_state(_job_profile(job_id, profile), "pause_job", job_id))
 
 
 def _resume_cron_job_sync(job_id: str, profile: Optional[str] = None):
-    return _found(_mutate_cron_for_profile(_job_profile(job_id, profile), "resume_job", job_id))
+    return _found(_mutate_cron_state(_job_profile(job_id, profile), "resume_job", job_id))
 
 
 def _trigger_cron_job_sync(job_id: str, profile: Optional[str] = None):
     selected = _job_profile(job_id, profile)
+    try:
+        return _trigger_resolved_cron_job(selected, job_id)
+    except ValueError as exc:
+        # A terminal job names its own remedy ("create a new occurrence with
+        # 'hermes cron resume ...'"); a 500 threw that away.
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _trigger_resolved_cron_job(selected: str, job_id: str):
     job = _found(_call_cron_for_profile(selected, "resolve_job_ref", job_id))
     # Never expose the job as due before claiming it: the built-in ticker and
     # external/manual fire paths share one durable claim, so only one executes
@@ -182,6 +205,17 @@ def _trigger_cron_job_sync(job_id: str, profile: Optional[str] = None):
     if refreshed and refreshed.get("last_run_at") != job.get("last_run_at"):
         return refreshed
     if not ran:
+        # A lost claim has two very different causes and they must not share a
+        # sentence: another scheduler got there first, or the job has no
+        # occurrence left to claim. Telling an operator their finished job "is
+        # already running" sends them looking for a run that does not exist.
+        state = (refreshed or job).get("state")
+        if state in ("completed", "error"):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Job is {state} and has no occurrence left to run. "
+                    "Resume it to schedule a new one, or create a new job."))
         raise HTTPException(status_code=409, detail="Job is already running or was claimed by another scheduler")
     if refreshed:
         return refreshed
