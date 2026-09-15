@@ -224,6 +224,20 @@ export const en: Translations = {
     perDayAvg: "/day avg",
     acrossModels: "across {count} models",
     inOut: "{input} in / {output} out",
+    cacheReads: "Cache Reads",
+    reasoning: "Reasoning",
+    estimatedCost: "Est. Cost",
+    auxiliaryWork: "Auxiliary Work",
+    auxiliaryWorkHint:
+      "Models the agent calls outside the conversation — compaction, vision, titles. Invisible in the transcript, and often a real share of the bill.",
+    task: "Task",
+    models: "Models",
+    calls: "Calls",
+    toolCalls: "Tool Calls",
+    toolCallsHint: "What the agent actually reached for, ranked by how often.",
+    tool: "Tool",
+    share: "Share",
+    countsOnly: "Counts of what the agent did. Not token estimates, so these are shown either way.",
   },
 
   models: {

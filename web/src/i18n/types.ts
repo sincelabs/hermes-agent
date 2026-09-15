@@ -238,6 +238,20 @@ export interface Translations {
     perDayAvg: string;
     acrossModels: string;
     inOut: string;
+    /** Optional — fall back to English literals until translated. */
+    cacheReads?: string;
+    reasoning?: string;
+    estimatedCost?: string;
+    auxiliaryWork?: string;
+    auxiliaryWorkHint?: string;
+    task?: string;
+    models?: string;
+    calls?: string;
+    toolCalls?: string;
+    toolCallsHint?: string;
+    tool?: string;
+    share?: string;
+    countsOnly?: string;
   };
 
   // ── Models page ──

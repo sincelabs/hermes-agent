@@ -2127,6 +2127,31 @@ export interface AnalyticsModelEntry {
   estimated_cost: number;
   sessions: number;
   api_calls: number;
+  /** Per-task rows folded in from `session_model_usage`; absent for a main-agent-only model. */
+  aux_tasks?: AnalyticsAuxTaskEntry[];
+}
+
+/**
+ * Auxiliary usage for one task slot (compression, vision, title generation, …),
+ * summed across every model that served it. `/api/analytics/usage` has returned
+ * this as `by_task` since the aux rows were added; nothing read it, so "what is
+ * compression costing me" had an answer on the wire and no answer on screen.
+ */
+export interface AnalyticsAuxTaskEntry {
+  task: string;
+  input_tokens: number;
+  output_tokens: number;
+  estimated_cost: number;
+  api_calls: number;
+  /** Which models served this task, most used first. */
+  models?: string[];
+}
+
+/** One tool, and how often the agent called it in the window. */
+export interface AnalyticsToolEntry {
+  tool: string;
+  count: number;
+  percentage: number;
 }
 
 export interface AnalyticsSkillEntry {
@@ -2148,6 +2173,9 @@ export interface AnalyticsSkillsSummary {
 export interface AnalyticsResponse {
   daily: AnalyticsDailyEntry[];
   by_model: AnalyticsModelEntry[];
+  by_task: AnalyticsAuxTaskEntry[];
+  tools: AnalyticsToolEntry[];
+  period_days: number;
   totals: {
     total_input: number;
     total_output: number;
